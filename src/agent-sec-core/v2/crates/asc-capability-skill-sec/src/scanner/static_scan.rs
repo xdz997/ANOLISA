@@ -270,15 +270,18 @@ fn manifest_error(rule: &str, message: &str, title: &str, remediation: &str) -> 
 
 fn path_findings(path: &str, findings: &mut Vec<Finding>) {
     let filename = path.rsplit('/').next().unwrap_or(path);
-    if path.split('/').any(|part| part.starts_with('.')) {
-        if SECRET_FILES.contains(&filename) {
-            findings.push(item("secret-material-file", "high", "Skill contains a file name commonly used for secrets or credentials.", Some(path), None,
-                json!({"category":"credential_access","title":"Credential-like file included","remediation":"Remove secrets and credential files from the Skill package."})));
-        } else if path != ".clawhub/origin.json" {
-            findings.push(item("hidden-file", "medium", "Skill contains a hidden file or directory.", Some(path), None,
-                json!({"category":"filesystem","title":"Hidden file included","remediation":"Keep hidden files out of Skill packages unless they are documented and required."})));
-        }
+    if SECRET_FILES.contains(&filename) {
+        findings.push(item("secret-material-file", "high", "Skill contains a file name commonly used for secrets or credentials.", Some(path), None,
+            json!({"category":"credential_access","title":"Credential-like file included","remediation":"Remove secrets and credential files from the Skill package."})));
+    } else if path.split('/').any(|part| part.starts_with('.')) && path != ".clawhub/origin.json" {
+        findings.push(item("hidden-file", "medium", "Skill contains a hidden file or directory.", Some(path), None,
+            json!({"category":"filesystem","title":"Hidden file included","remediation":"Keep hidden files out of Skill packages unless they are documented and required."})));
     }
+    // Extension-only private-key detection is deferred: .pem can be a public
+    // certificate, .jks/.p12 can hold trust-only material — an ambiguous
+    // extension alone is insufficient evidence for a high-severity finding.
+    // Only exact known-filename matches (id_rsa, id_ed25519, .env, etc.)
+    // produce a credential finding.
     if BINARY_EXTENSIONS.contains(&extension(path).as_str()) {
         findings.push(item("suspicious-binary-asset", "medium", "Skill contains a binary executable or bytecode-like asset.", Some(path), None,
             json!({"category":"binary_asset","title":"Suspicious binary asset","remediation":"Remove binary executables or document and verify their provenance."})));
@@ -526,5 +529,53 @@ mod tests {
             network(&json!({}), &[], &mut Vec::new(), Instant::now()),
             Err(SkillSecError::Timeout)
         ));
+    }
+
+    fn rules_for(path: &str) -> Vec<String> {
+        let mut findings = Vec::new();
+        path_findings(path, &mut findings);
+        findings.into_iter().map(|finding| finding.rule).collect()
+    }
+
+    #[test]
+    fn credential_files_are_flagged_without_a_hidden_parent() {
+        for path in ["id_rsa", "id_ed25519", "keys/id_rsa", ".env"] {
+            assert!(
+                rules_for(path).contains(&"secret-material-file".to_owned()),
+                "{path}"
+            );
+        }
+        // Hidden-path bookkeeping is unchanged: non-secret dot-paths still warn.
+        assert!(rules_for(".ssh/config").contains(&"hidden-file".to_owned()));
+        let clawhub = rules_for(".clawhub/origin.json");
+        assert!(clawhub.iter().all(|rule| rule != "hidden-file"));
+        assert!(rules_for(".clawhub/other.json").contains(&"hidden-file".to_owned()));
+    }
+
+    #[test]
+    fn extension_only_key_material_is_not_flagged() {
+        // Extension-only private-key detection is deferred per review: .pem can
+        // be a public certificate, .jks/.p12 can hold trust-only material.
+        // An ambiguous extension alone is insufficient evidence for a
+        // high-severity finding — only exact known-filename matches fire.
+        for path in [
+            "cert.pem",
+            "truststore.jks",
+            "backup.p12",
+            "wallet.pfx",
+            "server.key",
+            "keys/app.keystore",
+            "identity.ppk",
+        ] {
+            let rules = rules_for(path);
+            assert!(
+                !rules.contains(&"key-material-file".to_owned()),
+                "{path}: extension alone must not produce a key-material finding"
+            );
+            assert!(
+                !rules.contains(&"secret-material-file".to_owned()),
+                "{path}: non-SECRET_FILES name must not produce a secret finding"
+            );
+        }
     }
 }
