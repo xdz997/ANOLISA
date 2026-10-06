@@ -164,7 +164,15 @@ impl BuiltinDetector {
                 let pattern = match id.as_str() {
                     "_JWT_RE" => r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{3,}\.[A-Za-z0-9_-]{8,}".into(),
                     "_API_KEY_RE" => {
-                        r"(?:sk|pk|rk|gh[pousr]|xox[baprs])[-_][A-Za-z0-9_=-]{16}".into()
+                        // Canonical CI/CD and cloud token prefixes alongside the
+                        // generic sk/pk/rk shapes: GitHub fine-grained personal
+                        // access tokens, GitLab personal access tokens, PyPI
+                        // upload tokens, npm tokens and AWS access key ids.
+                        // The api_key matcher extends every candidate to the
+                        // token's word boundary, so the {16} floors are
+                        // minima, not exact lengths.
+                        r"(?:sk|pk|rk|gh[pousr]|xox[baprs]|glpat|npm|pypi)[-_][A-Za-z0-9_=-]{16}|github_pat_[A-Za-z0-9_]{16,}|AKIA[0-9A-Z]{16}"
+                            .into()
                     }
                     "_EMAIL_RE" => r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}".into(),
                     _ => python_pattern(&pattern),
@@ -684,6 +692,19 @@ fn remote_command(prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanner_version_reflects_ci_cd_prefix_semantics() {
+        // The canonical CI/CD token prefixes (github_pat_, glpat, npm, pypi,
+        // AKIA) change the detector's matching semantics; the report identity
+        // must not claim the pre-expansion version.
+        assert_eq!(crate::SCANNER_VERSION, "2.1.0");
+        let scanner = crate::PiiScanner::new().unwrap();
+        let report = scanner
+            .scan("github_pat_11ABCDEFG0abcdefghij", &Default::default())
+            .unwrap();
+        assert_eq!(report.summary.scanner_version, "2.1.0");
+    }
 
     #[test]
     fn frozen_python_classes_cover_every_unicode_scalar() {

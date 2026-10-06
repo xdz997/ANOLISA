@@ -28,4 +28,6 @@ pub use rules::{DEFAULT_CUSTOM_RULES_PATH, PiiRuleSet};
 pub use scanner::PiiScanner;
 
 /// Detection semantics version, independent of the `AgentSecCore` package version.
-pub const SCANNER_VERSION: &str = "2.0.0";
+/// Bumped to 2.1.0 for the canonical CI/CD token prefixes (github_pat_,
+/// glpat, npm, pypi, AKIA) joining the `_API_KEY_RE` matching semantics.
+pub const SCANNER_VERSION: &str = "2.1.0";
