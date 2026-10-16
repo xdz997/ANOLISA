@@ -640,13 +640,20 @@ impl SkillFs {
                             reply.error(libc::ENOENT);
                             return;
                         }
-                        let phys_dir = match self.resolve_hermes_nested_read(category, skill_name) {
-                            ReadResolution::Snapshot { dir, .. } => dir.join(relative_path),
-                            _ => self
-                                .source_base()
-                                .join(category)
-                                .join(skill_name)
-                                .join(relative_path),
+                        // I4 grace bypass, mirroring the flat readdir: a
+                        // whitelisted directory lists the live source during
+                        // a post-publish grace session, agreeing with lookup,
+                        // getattr, and access.
+                        let phys_dir = match self.nested_access_read_path(
+                            category,
+                            skill_name,
+                            Some(relative_path.as_path()),
+                        ) {
+                            Some(path) => path,
+                            None => {
+                                reply.error(libc::ENOENT);
+                                return;
+                            }
                         };
                         let parent_ino = {
                             let parent_path = Path::new(&path)
@@ -1346,13 +1353,16 @@ impl SkillFs {
                         {
                             return reply.error(libc::ENOENT);
                         }
-                        let phys_dir = match self.resolve_hermes_nested_read(category, skill_name) {
-                            ReadResolution::Snapshot { dir, .. } => dir.join(relative_path),
-                            _ => self
-                                .source_base()
-                                .join(category)
-                                .join(skill_name)
-                                .join(relative_path),
+                        // I4 grace bypass, mirroring the flat opendir: a
+                        // whitelisted directory reads the live source during
+                        // a post-publish grace session.
+                        let phys_dir = match self.nested_access_read_path(
+                            category,
+                            skill_name,
+                            Some(relative_path.as_path()),
+                        ) {
+                            Some(path) => path,
+                            None => return reply.error(libc::ENOENT),
                         };
                         let parent_ino = {
                             let parent_path = Path::new(&path)

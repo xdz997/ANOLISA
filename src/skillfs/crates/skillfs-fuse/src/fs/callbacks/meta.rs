@@ -495,15 +495,22 @@ impl SkillFs {
                     reply.error(libc::ENOENT);
                     return;
                 }
-                let physical = match self.resolve_hermes_nested_read(category, skill_name) {
-                    crate::fs::read_resolution::ReadResolution::Snapshot { dir, .. } => {
-                        dir.join(relative_path)
+                // I4 grace bypass, mirroring the flat lookup: during a
+                // post-publish grace session a whitelisted relative path
+                // resolves against the live source so installers can stat
+                // files that only exist there. `nested_access_read_path`
+                // is the same resolver the access/readlink/xattr callbacks
+                // use, so every nested read surface agrees on the target.
+                let physical = match self.nested_access_read_path(
+                    category,
+                    skill_name,
+                    Some(relative_path.as_path()),
+                ) {
+                    Some(path) => path,
+                    None => {
+                        reply.error(libc::ENOENT);
+                        return;
                     }
-                    _ => self
-                        .source_base()
-                        .join(category)
-                        .join(skill_name)
-                        .join(relative_path),
                 };
                 match std::fs::symlink_metadata(&physical) {
                     Ok(meta) => {
@@ -897,15 +904,19 @@ impl SkillFs {
                     reply.error(libc::ENOENT);
                     return;
                 }
-                let physical = match self.resolve_hermes_nested_read(category, skill_name) {
-                    crate::fs::read_resolution::ReadResolution::Snapshot { dir, .. } => {
-                        dir.join(relative_path)
+                // I4 grace bypass, mirroring the flat getattr: a whitelisted
+                // relative path stats the live source during a post-publish
+                // grace session, agreeing with lookup and access.
+                let physical = match self.nested_access_read_path(
+                    category,
+                    skill_name,
+                    Some(relative_path.as_path()),
+                ) {
+                    Some(path) => path,
+                    None => {
+                        reply.error(libc::ENOENT);
+                        return;
                     }
-                    _ => self
-                        .source_base()
-                        .join(category)
-                        .join(skill_name)
-                        .join(relative_path),
                 };
                 match std::fs::symlink_metadata(&physical) {
                     Ok(meta) => {

@@ -2888,6 +2888,178 @@ fn post_publish_grace_fallback_skill_md_not_opened_via_grace() {
         content
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// I4 for Hermes: post-publish grace on a nested fallback snapshot
+//
+// The nested read surface must honor the post-publish grace whitelist the
+// same way the flat layout does: lookup, getattr, readdir, and open of a
+// whitelisted path resolve against the live source during a grace session,
+// agreeing with `nested_access_read_path` (access/readlink/xattr).
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct HermesFallbackGraceFixture {
+    #[allow(dead_code)]
+    source: tempfile::TempDir,
+    mountpoint: tempfile::TempDir,
+    handle: Option<MountHandle>,
+    #[allow(dead_code)]
+    notify_controller: Arc<NotifyController>,
+    post_publish_controller: Arc<PostPublishGraceController>,
+}
+
+impl HermesFallbackGraceFixture {
+    fn new(grace_ms: u64, seed: impl FnOnce(&Path, &Path)) -> Self {
+        let source = tempfile::tempdir().unwrap();
+        let snapshot_dir = source
+            .path()
+            .join("apple/fallback-skill/.skill-meta/versions/v1");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        seed(source.path(), &snapshot_dir);
+
+        let mut store = SkillStore::new();
+        store.load_from_directory(source.path(), &ParseConfig::default());
+        let shared: SharedSkillStore = Arc::new(RwLock::new(store));
+
+        let mountpoint = tempfile::tempdir().unwrap();
+        let notify_client = Arc::new(InMemoryNotifyClient::new());
+
+        let notify_ctrl = NotifyController::new(
+            notify_client.clone(),
+            source.path().to_path_buf(),
+            Duration::from_millis(50),
+            5000,
+        );
+
+        let resolver = Arc::new(ActiveSkillResolver::new(source.path()));
+        resolver.set(
+            "apple/fallback-skill".to_string(),
+            ActiveTarget::Snapshot {
+                snapshot_dir: snapshot_dir.clone(),
+                version: "v1".to_string(),
+            },
+        );
+
+        let pp_patterns = vec![PostPublishWritePattern::PrefixRecursive(
+            ".clawhub".to_string(),
+        )];
+        let pp_ctrl =
+            PostPublishGraceController::new(Duration::from_millis(grace_ms), pp_patterns);
+
+        let config = MountConfig {
+            notify_controller: Some(notify_ctrl.clone()),
+            active_resolver: Some(resolver),
+            post_publish_controller: Some(pp_ctrl.clone()),
+            skill_layout: Some(SkillLayout::Hermes),
+            ..MountConfig::default()
+        };
+
+        let handle = mount_background_configured(
+            mountpoint.path(),
+            source.path(),
+            shared,
+            MountOptions::default(),
+            true,
+            config,
+        )
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        Self {
+            source,
+            mountpoint,
+            handle: Some(handle),
+            notify_controller: notify_ctrl,
+            post_publish_controller: pp_ctrl,
+        }
+    }
+
+    fn skill_path(&self) -> PathBuf {
+        self.mountpoint.path().join("apple/fallback-skill")
+    }
+}
+
+impl Drop for HermesFallbackGraceFixture {
+    fn drop(&mut self) {
+        self.post_publish_controller.shutdown();
+        self.notify_controller.shutdown();
+        if let Some(handle) = self.handle.take() {
+            drop(handle);
+        }
+        let mp = self.mountpoint.path().to_path_buf();
+        std::thread::sleep(Duration::from_millis(150));
+        let _ = std::process::Command::new("fusermount3")
+            .args(["-u", &mp.to_string_lossy()])
+            .output();
+    }
+}
+
+#[test]
+fn hermes_post_publish_grace_fallback_snapshot_serves_whitelisted_reads() {
+    skip_if_no_fuse!();
+
+    let fixture = HermesFallbackGraceFixture::new(5000, |src, snapshot| {
+        // Physical source has the skill with a whitelisted .clawhub file
+        // and a non-whitelisted source-only file.
+        let skill = src.join("apple/fallback-skill");
+        std::fs::create_dir_all(skill.join(".clawhub")).unwrap();
+        std::fs::create_dir_all(skill.join("data")).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: fallback-skill\ndescription: live\n---\n",
+        )
+        .unwrap();
+        std::fs::write(skill.join(".clawhub/origin.json"), "installer-data").unwrap();
+        std::fs::write(skill.join("data/secret.txt"), "secret").unwrap();
+
+        // The snapshot only has SKILL.md, with different content.
+        std::fs::write(
+            snapshot.join("SKILL.md"),
+            "---\nname: fallback-skill\ndescription: snapshot\n---\n",
+        )
+        .unwrap();
+    });
+
+    fixture
+        .post_publish_controller
+        .start_session("apple/fallback-skill", PostPublishSessionKind::StagingRename);
+
+    let skill_via_fuse = fixture.skill_path();
+
+    // The whitelisted file must be stat-able and readable through the same
+    // live source that `nested_access_read_path` already promises to
+    // access()/readlink()/xattr during grace, exactly as the flat layout
+    // does (I4).
+    let meta = std::fs::metadata(skill_via_fuse.join(".clawhub/origin.json"));
+    assert!(
+        meta.is_ok(),
+        "lookup/getattr must honor the grace whitelist: {:?}",
+        meta.err()
+    );
+    let content = std::fs::read_to_string(skill_via_fuse.join(".clawhub/origin.json"));
+    assert_eq!(
+        content.unwrap_or_default(),
+        "installer-data",
+        "whitelisted reads during grace must serve the live source, not the snapshot"
+    );
+
+    // The grace whitelist must not broaden to SKILL.md: it keeps serving
+    // the snapshot view.
+    let skill_md = std::fs::read_to_string(skill_via_fuse.join("SKILL.md")).unwrap();
+    assert!(
+        skill_md.contains("snapshot"),
+        "SKILL.md must keep coming from the snapshot during grace: {skill_md}"
+    );
+
+    // Outside the whitelist the snapshot view stays authoritative: a
+    // source-only file is absent.
+    let rejected = std::fs::read(skill_via_fuse.join("data/secret.txt"));
+    assert!(
+        rejected.is_err(),
+        "non-whitelisted source-only files must stay invisible"
+    );
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // H3: Hermes installer compatibility tests
 //

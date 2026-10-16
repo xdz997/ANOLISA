@@ -603,7 +603,19 @@ impl SkillFs {
                                     physical = dir.join("SKILL.md");
                                 }
                                 PathType::NestedPassthrough { relative_path, .. } => {
-                                    physical = dir.join(relative_path);
+                                    // I4 grace bypass, mirroring the flat open:
+                                    // a whitelisted path opens the live source
+                                    // during a post-publish grace session, so
+                                    // the file the installer just wrote (and
+                                    // that access/lookup already promise) is
+                                    // readable instead of ENOENT from the
+                                    // snapshot view.
+                                    if !self.is_post_publish_grace_allowed(
+                                        &nested_id,
+                                        Some(relative_path.as_path()),
+                                    ) {
+                                        physical = dir.join(relative_path);
+                                    }
                                 }
                                 _ => {}
                             }
